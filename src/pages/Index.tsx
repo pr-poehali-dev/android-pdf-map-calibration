@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import Icon from '@/components/ui/icon';
 import * as pdfjsLib from 'pdfjs-dist';
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
@@ -8,24 +8,52 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
 interface ControlPoint {
   id: number;
   label: string;
-  px: number; // % from map frame
+  px: number;
   py: number;
   lat: string;
   lon: string;
   status: 'fixed' | 'pending';
 }
 
-interface PendingPoint {
-  px: number;
-  py: number;
+interface PendingPoint { px: number; py: number; }
+interface LivePos { lat: number; lon: number; accuracy: number; heading: number | null; }
+
+// Affine calibration: map geo→px using 3+ fixed points
+function geoToMapPct(
+  lat: number, lon: number,
+  pts: ControlPoint[]
+): { px: number; py: number } | null {
+  const fixed = pts.filter(p => p.status === 'fixed' && p.lat !== '—' && p.lon !== '—');
+  if (fixed.length < 3) return null;
+  // Simple centroid-based affine (least squares with 3 pts)
+  const p = fixed.slice(0, 3);
+  const [la0, lo0, la1, lo1, la2, lo2] = [
+    parseFloat(p[0].lat), parseFloat(p[0].lon),
+    parseFloat(p[1].lat), parseFloat(p[1].lon),
+    parseFloat(p[2].lat), parseFloat(p[2].lon),
+  ];
+  const [px0, py0, px1, py1, px2, py2] = [p[0].px, p[0].py, p[1].px, p[1].py, p[2].px, p[2].py];
+  const dLat1 = la1 - la0, dLon1 = lo1 - lo0;
+  const dLat2 = la2 - la0, dLon2 = lo2 - lo0;
+  const det = dLat1 * dLon2 - dLat2 * dLon1;
+  if (Math.abs(det) < 1e-15) return null;
+  const dPx1 = px1 - px0, dPy1 = py1 - py0;
+  const dPx2 = px2 - px0, dPy2 = py2 - py0;
+  const dLat = lat - la0, dLon = lon - lo0;
+  const t = (dLat * dLon2 - dLon * dLat2) / det;
+  const s = (dLon * dLat1 - dLat * dLon1) / det;
+  return {
+    px: px0 + t * dPx1 + s * dPx2,
+    py: py0 + t * dPy1 + s * dPy2,
+  };
 }
 
 const tools = [
   { id: 'select', icon: 'MousePointer2', label: 'Выбор' },
-  { id: 'point', icon: 'MapPin', label: 'Контр. точка' },
-  { id: 'distance', icon: 'Ruler', label: 'Расстояние' },
-  { id: 'area', icon: 'Hexagon', label: 'Площадь' },
-  { id: 'gnss', icon: 'Satellite', label: 'GNSS' },
+  { id: 'point',  icon: 'MapPin',        label: 'Контр. точка' },
+  { id: 'distance', icon: 'Ruler',       label: 'Расстояние' },
+  { id: 'area',   icon: 'Hexagon',       label: 'Площадь' },
+  { id: 'gnss',   icon: 'Satellite',     label: 'GNSS' },
 ];
 
 let nextId = 5;
@@ -39,25 +67,34 @@ const Index = () => {
     { id: 3, label: 'КТ-03', px: 30, py: 74, lat: '55.749103', lon: '37.616890', status: 'fixed' },
   ]);
 
-  // PDF state
-  const [pdfName, setPdfName] = useState<string | null>(null);
+  // PDF
+  const [pdfName, setPdfName]   = useState<string | null>(null);
   const [pdfPages, setPdfPages] = useState(0);
-  const [pageNum, setPageNum] = useState(1);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [pageNum, setPageNum]   = useState(1);
+  const [loading, setLoading]   = useState(false);
+  const [error, setError]       = useState<string | null>(null);
 
-  // New point popup
-  const [pending, setPending] = useState<PendingPoint | null>(null);
-  const [latInput, setLatInput] = useState('');
-  const [lonInput, setLonInput] = useState('');
+  // New-point popup
+  const [pending, setPending]       = useState<PendingPoint | null>(null);
+  const [latInput, setLatInput]     = useState('');
+  const [lonInput, setLonInput]     = useState('');
   const [labelInput, setLabelInput] = useState('');
+  const [gnssLoading, setGnssLoading] = useState(false);
+  const [gnssAccuracy, setGnssAccuracy] = useState<number | null>(null);
+  const [gnssError, setGnssError]   = useState<string | null>(null);
 
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Live tracking
+  const [tracking, setTracking]     = useState(false);
+  const [livePos, setLivePos]       = useState<LivePos | null>(null);
+  const [trackError, setTrackError] = useState<string | null>(null);
+  const watchIdRef = useRef<number | null>(null);
+
+  const canvasRef    = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const mapFrameRef = useRef<HTMLDivElement>(null);
-  const pdfDocRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
+  const mapFrameRef  = useRef<HTMLDivElement>(null);
+  const pdfDocRef    = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
 
-  const fixedCount = points.filter((p) => p.status === 'fixed').length;
+  const fixedCount = points.filter(p => p.status === 'fixed').length;
 
   /* ── PDF ── */
   const renderPage = async (num: number) => {
@@ -77,15 +114,12 @@ const Index = () => {
     const file = e.target.files?.[0];
     if (!file) return;
     if (file.type !== 'application/pdf') { setError('Нужен PDF-файл'); return; }
-    setError(null);
-    setLoading(true);
+    setError(null); setLoading(true);
     try {
       const buffer = await file.arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
       pdfDocRef.current = pdf;
-      setPdfName(file.name);
-      setPdfPages(pdf.numPages);
-      setPageNum(1);
+      setPdfName(file.name); setPdfPages(pdf.numPages); setPageNum(1);
       await renderPage(1);
     } catch { setError('Не удалось открыть PDF'); }
     finally { setLoading(false); }
@@ -94,8 +128,72 @@ const Index = () => {
   const changePage = async (dir: number) => {
     const next = pageNum + dir;
     if (next < 1 || next > pdfPages) return;
-    setPageNum(next);
-    await renderPage(next);
+    setPageNum(next); await renderPage(next);
+  };
+
+  /* ── Live tracking ── */
+  const startTracking = () => {
+    if (!navigator.geolocation) { setTrackError('Геолокация не поддерживается браузером'); return; }
+    setTrackError(null);
+    setTracking(true);
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        setLivePos({
+          lat: pos.coords.latitude,
+          lon: pos.coords.longitude,
+          accuracy: Math.round(pos.coords.accuracy * 10) / 10,
+          heading: pos.coords.heading,
+        });
+        setTrackError(null);
+      },
+      (err) => {
+        const msgs: Record<number, string> = {
+          1: 'Доступ к геолокации запрещён',
+          2: 'Сигнал GNSS недоступен',
+          3: 'Таймаут GNSS',
+        };
+        setTrackError(msgs[err.code] ?? 'Ошибка GNSS');
+      },
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 1000 }
+    );
+  };
+
+  const stopTracking = () => {
+    if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+    setTracking(false);
+  };
+
+  // Cleanup on unmount
+  useEffect(() => () => { if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current); }, []);
+
+  // Compute map position of live marker via affine calibration
+  const liveMapPos = livePos ? geoToMapPct(livePos.lat, livePos.lon, points) : null;
+
+  /* ── GNSS single capture ── */
+  const captureGnss = () => {
+    if (!navigator.geolocation) { setGnssError('Геолокация не поддерживается'); return; }
+    setGnssLoading(true); setGnssError(null); setGnssAccuracy(null);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setLatInput(pos.coords.latitude.toFixed(7));
+        setLonInput(pos.coords.longitude.toFixed(7));
+        setGnssAccuracy(Math.round(pos.coords.accuracy * 10) / 10);
+        setGnssLoading(false);
+      },
+      (err) => {
+        const msgs: Record<number, string> = {
+          1: 'Доступ запрещён — разрешите геолокацию в браузере',
+          2: 'Сигнал GNSS недоступен',
+          3: 'Таймаут — нет ответа от GNSS',
+        };
+        setGnssError(msgs[err.code] ?? 'Ошибка GNSS');
+        setGnssLoading(false);
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+    );
   };
 
   /* ── Click on map ── */
@@ -104,58 +202,47 @@ const Index = () => {
     if (!pdfName) return;
     const frame = mapFrameRef.current;
     if (!frame) return;
-    // Skip if click landed on an existing point button
     if ((e.target as HTMLElement).closest('[data-point]')) return;
     const rect = frame.getBoundingClientRect();
     const px = ((e.clientX - rect.left) / rect.width) * 100;
     const py = ((e.clientY - rect.top) / rect.height) * 100;
     const id = nextId++;
     setLabelInput(`КТ-0${id}`);
-    setLatInput('');
-    setLonInput('');
+    setLatInput(''); setLonInput('');
+    setGnssAccuracy(null); setGnssError(null);
     setPending({ px, py });
     setSelectedPoint(null);
   }, [activeTool, pdfName]);
 
   const confirmPoint = () => {
     if (!pending) return;
-    const id = nextId - 1; // was incremented at click
-    setPoints((prev) => [
-      ...prev,
-      {
-        id,
-        label: labelInput || `КТ-0${id}`,
-        px: pending.px,
-        py: pending.py,
-        lat: latInput || '—',
-        lon: lonInput || '—',
-        status: latInput ? 'fixed' : 'pending',
-      },
-    ]);
+    const id = nextId - 1;
+    setPoints(prev => [...prev, {
+      id, label: labelInput || `КТ-0${id}`,
+      px: pending.px, py: pending.py,
+      lat: latInput || '—', lon: lonInput || '—',
+      status: latInput ? 'fixed' : 'pending',
+    }]);
     setSelectedPoint(id);
     setPending(null);
   };
 
-  const cancelPoint = () => {
-    nextId--;
-    setPending(null);
-  };
+  const cancelPoint = () => { nextId--; setPending(null); };
 
   const deletePoint = (id: number) => {
-    setPoints((prev) => prev.filter((p) => p.id !== id));
+    setPoints(prev => prev.filter(p => p.id !== id));
     if (selectedPoint === id) setSelectedPoint(null);
   };
 
-  const cursorClass =
-    activeTool === 'point' && pdfName ? 'cursor-crosshair' : 'cursor-default';
+  const cursorClass = activeTool === 'point' && pdfName ? 'cursor-crosshair' : 'cursor-default';
 
   return (
     <div className="min-h-screen flex flex-col bg-background text-foreground">
       <input ref={fileInputRef} type="file" accept="application/pdf" className="hidden" onChange={handleFile} />
 
       {/* Top bar */}
-      <header className="flex items-center justify-between border-b border-border px-5 h-14 shrink-0">
-        <div className="flex items-center gap-3">
+      <header className="flex items-center justify-between border-b border-border px-5 h-14 shrink-0 gap-3">
+        <div className="flex items-center gap-3 shrink-0">
           <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
             <Icon name="Compass" size={18} />
           </div>
@@ -165,19 +252,38 @@ const Index = () => {
           </div>
         </div>
 
-        <div className="hidden items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 md:flex">
-          <span className="relative flex h-2 w-2">
-            <span className="absolute inline-flex h-full w-full animate-ping-slow rounded-full bg-primary" />
-            <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
-          </span>
-          <span className="font-mono text-xs text-muted-foreground">
-            GNSS · <span className="text-primary">12 спутников</span> · ±0.8 м
-          </span>
+        {/* GNSS live status — center */}
+        <div className="flex items-center gap-3">
+          {livePos && (
+            <div className="hidden items-center gap-2 rounded-full border border-primary/40 bg-primary/10 px-3 py-1.5 md:flex animate-fade-in">
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping-slow rounded-full bg-primary" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
+              </span>
+              <span className="font-mono text-xs text-primary">
+                {livePos.lat.toFixed(6)} · {livePos.lon.toFixed(6)}
+              </span>
+              <span className="font-mono text-xs text-muted-foreground">±{livePos.accuracy} м</span>
+            </div>
+          )}
+
+          {/* tracking toggle */}
+          <button
+            onClick={tracking ? stopTracking : startTracking}
+            className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition-all ${
+              tracking
+                ? 'border-destructive/50 bg-destructive/15 text-destructive hover:bg-destructive/25'
+                : 'border-accent/40 bg-accent/10 text-accent hover:bg-accent/20'
+            }`}
+          >
+            <Icon name={tracking ? 'CircleStop' : 'Navigation'} size={14} />
+            {tracking ? 'Стоп' : 'Следить'}
+          </button>
         </div>
 
         <button
           onClick={() => fileInputRef.current?.click()}
-          className="flex items-center gap-2 rounded-md bg-primary px-3.5 py-1.5 text-sm font-medium text-primary-foreground transition-transform hover:scale-[1.03]"
+          className="flex shrink-0 items-center gap-2 rounded-md bg-primary px-3.5 py-1.5 text-sm font-medium text-primary-foreground transition-transform hover:scale-[1.03]"
         >
           <Icon name="Upload" size={15} />
           Загрузить PDF
@@ -191,7 +297,7 @@ const Index = () => {
             <button
               key={t.id}
               onClick={() => { setActiveTool(t.id); setPending(null); }}
-              className={`group relative flex h-12 w-12 flex-col items-center justify-center rounded-lg transition-colors ${
+              className={`flex h-12 w-12 flex-col items-center justify-center rounded-lg transition-colors ${
                 activeTool === t.id
                   ? 'bg-primary text-primary-foreground'
                   : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
@@ -212,7 +318,7 @@ const Index = () => {
         <main className="relative flex-1 overflow-auto grid-blueprint-fine">
           <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-px animate-scan bg-primary/40 shadow-[0_0_12px_2px_hsl(var(--primary)/0.5)]" />
 
-          {/* map frame — click target */}
+          {/* map frame */}
           <div
             ref={mapFrameRef}
             onClick={handleMapClick}
@@ -246,7 +352,7 @@ const Index = () => {
               <canvas ref={canvasRef} className="mx-auto rounded shadow-2xl" />
             </div>
 
-            {/* existing control points */}
+            {/* control points */}
             {points.map((p) => (
               <div
                 key={p.id}
@@ -262,13 +368,9 @@ const Index = () => {
                 >
                   <span className={`h-2 w-2 rounded-full ${p.status === 'fixed' ? 'bg-primary' : 'bg-accent'}`} />
                 </button>
-
-                {/* label always visible */}
                 <span className="pointer-events-none absolute left-7 top-1/2 -translate-y-1/2 whitespace-nowrap rounded bg-card/90 px-1.5 py-0.5 font-mono text-[10px] text-foreground">
                   {p.label}
                 </span>
-
-                {/* delete button on hover */}
                 <button
                   data-point="true"
                   onClick={(e) => { e.stopPropagation(); deletePoint(p.id); }}
@@ -279,10 +381,42 @@ const Index = () => {
               </div>
             ))}
 
-            {/* ghost point while popup open */}
-            {pending && (
+            {/* ── Live position marker ── */}
+            {liveMapPos && (
               <div
-                style={{ left: `${pending.px}%`, top: `${pending.py}%` }}
+                style={{ left: `${liveMapPos.px}%`, top: `${liveMapPos.py}%` }}
+                className="pointer-events-none absolute z-40 -translate-x-1/2 -translate-y-1/2"
+              >
+                {/* accuracy circle */}
+                <span className="absolute left-1/2 top-1/2 block -translate-x-1/2 -translate-y-1/2 rounded-full border border-accent/40 bg-accent/10"
+                  style={{
+                    width: `${Math.max(24, Math.min(livePos!.accuracy * 1.5, 120))}px`,
+                    height: `${Math.max(24, Math.min(livePos!.accuracy * 1.5, 120))}px`,
+                  }}
+                />
+                {/* pulse ring */}
+                <span className="absolute left-1/2 top-1/2 h-8 w-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-accent/60 animate-ping-slow" />
+                {/* dot */}
+                <span className="relative flex h-4 w-4 items-center justify-center rounded-full border-2 border-white bg-accent shadow-lg">
+                  <span className="h-1.5 w-1.5 rounded-full bg-white" />
+                </span>
+                {/* label */}
+                <span className="absolute left-5 top-1/2 -translate-y-1/2 whitespace-nowrap rounded bg-accent/90 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-primary-foreground shadow">
+                  Я здесь · ±{livePos!.accuracy} м
+                </span>
+              </div>
+            )}
+
+            {/* live pos outside calibrated area notice */}
+            {livePos && !liveMapPos && pdfName && fixedCount >= 3 && (
+              <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1.5 rounded-full bg-accent/20 border border-accent/40 px-3 py-1.5 font-mono text-[11px] text-accent">
+                <Icon name="Navigation" size={12} /> Позиция за пределами откалиброванной области
+              </div>
+            )}
+
+            {/* ghost point */}
+            {pending && (
+              <div style={{ left: `${pending.px}%`, top: `${pending.py}%` }}
                 className="pointer-events-none absolute z-30 -translate-x-1/2 -translate-y-1/2"
               >
                 <span className="flex h-6 w-6 items-center justify-center rounded-full border-2 border-dashed border-accent bg-accent/20 animate-pulse">
@@ -296,10 +430,7 @@ const Index = () => {
               <div
                 data-point="true"
                 onClick={(e) => e.stopPropagation()}
-                style={{
-                  left: `${Math.min(pending.px, 72)}%`,
-                  top: `${Math.min(pending.py + 4, 80)}%`,
-                }}
+                style={{ left: `${Math.min(pending.px, 72)}%`, top: `${Math.min(pending.py + 4, 80)}%` }}
                 className="absolute z-40 w-64 rounded-xl border border-primary/40 bg-card shadow-2xl animate-fade-in"
               >
                 <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
@@ -313,56 +444,54 @@ const Index = () => {
                 </div>
                 <div className="space-y-3 p-4">
                   <div>
-                    <label className="mb-1 block font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                      Название
-                    </label>
-                    <input
-                      autoFocus
-                      value={labelInput}
-                      onChange={(e) => setLabelInput(e.target.value)}
+                    <label className="mb-1 block font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Название</label>
+                    <input autoFocus value={labelInput} onChange={e => setLabelInput(e.target.value)}
                       className="w-full rounded-md border border-border bg-secondary px-3 py-1.5 font-mono text-sm text-foreground outline-none focus:border-primary"
-                      placeholder="КТ-05"
-                    />
+                      placeholder="КТ-05" />
                   </div>
                   <div className="grid grid-cols-2 gap-2">
                     <div>
-                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                        Широта (lat)
-                      </label>
-                      <input
-                        value={latInput}
-                        onChange={(e) => setLatInput(e.target.value)}
+                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Широта</label>
+                      <input value={latInput} onChange={e => setLatInput(e.target.value)}
                         className="w-full rounded-md border border-border bg-secondary px-3 py-1.5 font-mono text-sm text-foreground outline-none focus:border-primary"
-                        placeholder="55.7512"
-                      />
+                        placeholder="55.7512" />
                     </div>
                     <div>
-                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                        Долгота (lon)
-                      </label>
-                      <input
-                        value={lonInput}
-                        onChange={(e) => setLonInput(e.target.value)}
+                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Долгота</label>
+                      <input value={lonInput} onChange={e => setLonInput(e.target.value)}
                         className="w-full rounded-md border border-border bg-secondary px-3 py-1.5 font-mono text-sm text-foreground outline-none focus:border-primary"
-                        placeholder="37.6184"
-                      />
+                        placeholder="37.6184" />
                     </div>
                   </div>
-                  <div className="flex items-center gap-2 rounded-md bg-secondary px-2.5 py-2 text-[11px] text-muted-foreground">
-                    <Icon name="Satellite" size={12} className="text-accent shrink-0" />
-                    Или нажмите «Снять GNSS» — координаты определятся автоматически
-                  </div>
+
+                  <button type="button" onClick={captureGnss} disabled={gnssLoading}
+                    className="flex w-full items-center justify-center gap-2 rounded-md border border-accent/40 bg-accent/10 px-3 py-2 text-sm font-medium text-accent transition-colors hover:bg-accent/20 disabled:opacity-60"
+                  >
+                    {gnssLoading
+                      ? <><Icon name="LoaderCircle" size={15} className="animate-spin" /> Определяю…</>
+                      : <><Icon name="Satellite" size={15} /> Снять GNSS</>}
+                  </button>
+
+                  {gnssAccuracy !== null && (
+                    <div className="flex items-center gap-2 rounded-md bg-primary/10 px-2.5 py-2 font-mono text-[11px] text-primary">
+                      <Icon name="CircleCheck" size={13} className="shrink-0" />
+                      Точность ±{gnssAccuracy} м
+                    </div>
+                  )}
+                  {gnssError && (
+                    <div className="flex items-center gap-2 rounded-md bg-destructive/10 px-2.5 py-2 text-[11px] text-destructive-foreground">
+                      <Icon name="TriangleAlert" size={13} className="shrink-0 text-destructive" />
+                      {gnssError}
+                    </div>
+                  )}
+
                   <div className="flex gap-2">
-                    <button
-                      onClick={cancelPoint}
-                      className="flex-1 rounded-md border border-border py-2 text-sm text-muted-foreground hover:bg-secondary"
-                    >
+                    <button onClick={cancelPoint}
+                      className="flex-1 rounded-md border border-border py-2 text-sm text-muted-foreground hover:bg-secondary">
                       Отмена
                     </button>
-                    <button
-                      onClick={confirmPoint}
-                      className="flex-1 rounded-md bg-primary py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
-                    >
+                    <button onClick={confirmPoint}
+                      className="flex-1 rounded-md bg-primary py-2 text-sm font-medium text-primary-foreground hover:opacity-90">
                       Добавить
                     </button>
                   </div>
@@ -371,7 +500,7 @@ const Index = () => {
             )}
           </div>
 
-          {/* page navigation */}
+          {/* page nav */}
           {pdfPages > 1 && (
             <div className="absolute bottom-4 right-4 z-20 flex items-center gap-2 rounded-md border border-border bg-card/80 px-2 py-1.5 font-mono text-xs backdrop-blur">
               <button onClick={() => changePage(-1)} disabled={pageNum === 1} className="rounded p-1 hover:bg-secondary disabled:opacity-30">
@@ -385,8 +514,14 @@ const Index = () => {
           )}
 
           {error && (
-            <div className="absolute bottom-4 left-1/2 z-20 -translate-x-1/2 flex items-center gap-2 rounded-md border border-destructive bg-destructive/15 px-3 py-2 text-xs text-destructive-foreground">
+            <div className="absolute bottom-14 left-1/2 z-20 -translate-x-1/2 flex items-center gap-2 rounded-md border border-destructive bg-destructive/15 px-3 py-2 text-xs text-destructive-foreground">
               <Icon name="TriangleAlert" size={14} /> {error}
+            </div>
+          )}
+
+          {trackError && (
+            <div className="absolute bottom-14 left-1/2 z-20 -translate-x-1/2 flex items-center gap-2 rounded-md border border-destructive bg-destructive/15 px-3 py-2 text-xs text-destructive-foreground">
+              <Icon name="TriangleAlert" size={14} /> {trackError}
             </div>
           )}
 
@@ -400,15 +535,90 @@ const Index = () => {
 
           {/* coords HUD */}
           <div className="absolute bottom-4 left-4 z-20 flex items-center gap-4 rounded-md border border-border bg-card/80 px-3 py-2 font-mono text-xs backdrop-blur">
-            <span className="text-muted-foreground">N <span className="text-primary">55.750118</span></span>
-            <span className="text-muted-foreground">E <span className="text-primary">37.618901</span></span>
-            <span className="text-muted-foreground">M 1:2000</span>
+            {livePos ? (
+              <>
+                <span className="text-muted-foreground">N <span className="text-primary">{livePos.lat.toFixed(6)}</span></span>
+                <span className="text-muted-foreground">E <span className="text-primary">{livePos.lon.toFixed(6)}</span></span>
+                <span className="flex items-center gap-1 text-accent">
+                  <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse" />
+                  live ±{livePos.accuracy} м
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="text-muted-foreground">N <span className="text-foreground/50">—</span></span>
+                <span className="text-muted-foreground">E <span className="text-foreground/50">—</span></span>
+                <span className="text-muted-foreground">GNSS выкл</span>
+              </>
+            )}
           </div>
         </main>
 
         {/* Right panel */}
         <aside className="flex w-80 shrink-0 flex-col border-l border-border">
-          <section className="border-b border-border p-5 animate-fade-in">
+
+          {/* Live tracking card */}
+          <section className="border-b border-border p-5">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="flex items-center gap-2 text-sm font-semibold">
+                <Icon name="Navigation" size={16} className={tracking ? 'text-accent' : 'text-muted-foreground'} />
+                Моё положение
+              </h2>
+              <button
+                onClick={tracking ? stopTracking : startTracking}
+                className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-all ${
+                  tracking
+                    ? 'bg-destructive/20 text-destructive hover:bg-destructive/30'
+                    : 'bg-accent/15 text-accent hover:bg-accent/25'
+                }`}
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${tracking ? 'bg-destructive animate-pulse' : 'bg-accent'}`} />
+                {tracking ? 'Остановить' : 'Включить'}
+              </button>
+            </div>
+
+            {livePos ? (
+              <div className="space-y-2">
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="rounded-lg border border-border bg-secondary/50 p-2.5">
+                    <div className="mb-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Широта</div>
+                    <div className="font-mono text-sm font-semibold text-foreground">{livePos.lat.toFixed(7)}</div>
+                  </div>
+                  <div className="rounded-lg border border-border bg-secondary/50 p-2.5">
+                    <div className="mb-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Долгота</div>
+                    <div className="font-mono text-sm font-semibold text-foreground">{livePos.lon.toFixed(7)}</div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2">
+                  <Icon name="Crosshair" size={16} className="text-accent shrink-0" />
+                  <div>
+                    <div className="font-mono text-xs font-semibold text-accent">±{livePos.accuracy} м</div>
+                    <div className="font-mono text-[10px] text-muted-foreground">точность GNSS</div>
+                  </div>
+                  {livePos.heading !== null && (
+                    <div className="ml-auto text-right">
+                      <div className="font-mono text-xs font-semibold text-foreground">{Math.round(livePos.heading)}°</div>
+                      <div className="font-mono text-[10px] text-muted-foreground">азимут</div>
+                    </div>
+                  )}
+                </div>
+                {!liveMapPos && fixedCount < 3 && (
+                  <div className="flex items-center gap-2 rounded-md bg-secondary px-2.5 py-2 text-[11px] text-muted-foreground">
+                    <Icon name="Info" size={13} className="shrink-0 text-accent" />
+                    Добавьте 3+ привязанных точки для отображения позиции на карте
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 rounded-md bg-secondary px-3 py-2.5 text-xs text-muted-foreground">
+                <Icon name="Info" size={14} className="shrink-0 text-accent" />
+                {trackError ?? 'Нажмите «Включить» для отслеживания позиции на карте в реальном времени'}
+              </div>
+            )}
+          </section>
+
+          {/* Calibration */}
+          <section className="border-b border-border p-5">
             <div className="mb-3 flex items-center justify-between">
               <h2 className="flex items-center gap-2 text-sm font-semibold">
                 <Icon name="Target" size={16} className="text-primary" />
@@ -417,28 +627,24 @@ const Index = () => {
               <span className="font-mono text-xs text-muted-foreground">{fixedCount}/{Math.max(points.length, 4)} точки</span>
             </div>
             <div className="mb-3 h-1.5 w-full overflow-hidden rounded-full bg-secondary">
-              <div
-                className="h-full rounded-full bg-primary transition-all"
-                style={{ width: `${Math.min((fixedCount / 4) * 100, 100)}%` }}
-              />
+              <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${Math.min((fixedCount / 4) * 100, 100)}%` }} />
             </div>
             <div className="flex items-center gap-2 rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
               <Icon name="Info" size={14} className="shrink-0 text-accent" />
-              {fixedCount >= 4
-                ? 'Калибровка готова. Аффинное преобразование активно.'
-                : `Нужно ещё ${4 - fixedCount} точек для аффинного преобразования.`}
+              {fixedCount >= 3
+                ? fixedCount >= 4 ? 'Калибровка готова. Позиция отображается на карте.' : 'Аффинная калибровка активна (3 точки).'
+                : `Нужно ещё ${3 - fixedCount} точек для калибровки.`}
             </div>
           </section>
 
+          {/* Control points */}
           <section className="flex-1 overflow-y-auto p-5">
             <h3 className="mb-3 font-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
               Контрольные точки ({points.length})
             </h3>
             <div className="space-y-2">
               {points.map((p) => (
-                <div
-                  key={p.id}
-                  onClick={() => setSelectedPoint(selectedPoint === p.id ? null : p.id)}
+                <div key={p.id} onClick={() => setSelectedPoint(selectedPoint === p.id ? null : p.id)}
                   className={`group relative w-full cursor-pointer rounded-lg border p-3 transition-colors ${
                     selectedPoint === p.id ? 'border-primary bg-primary/5' : 'border-border hover:border-muted-foreground/40'
                   }`}
@@ -454,10 +660,8 @@ const Index = () => {
                       }`}>
                         {p.status === 'fixed' ? 'привязана' : 'ожидает'}
                       </span>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); deletePoint(p.id); }}
-                        className="hidden rounded p-0.5 text-muted-foreground hover:bg-destructive/20 hover:text-destructive group-hover:block"
-                      >
+                      <button onClick={(e) => { e.stopPropagation(); deletePoint(p.id); }}
+                        className="hidden rounded p-0.5 text-muted-foreground hover:bg-destructive/20 hover:text-destructive group-hover:block">
                         <Icon name="Trash2" size={13} />
                       </button>
                     </div>
@@ -470,19 +674,36 @@ const Index = () => {
               ))}
             </div>
 
-            <button
-              onClick={() => setActiveTool('point')}
+            <button onClick={() => setActiveTool('point')}
               className={`mt-3 flex w-full items-center justify-center gap-2 rounded-lg border border-dashed py-2.5 text-xs transition-colors ${
                 activeTool === 'point'
                   ? 'border-primary bg-primary/5 text-primary'
                   : 'border-border text-muted-foreground hover:border-primary hover:text-primary'
-              }`}
-            >
+              }`}>
               <Icon name="Plus" size={14} />
               {activeTool === 'point' ? 'Кликните на карту…' : 'Добавить точку на карте'}
             </button>
+
+            <button
+              onClick={() => {
+                if (!pdfName) return;
+                const id = nextId++;
+                setLabelInput(`КТ-0${id}`);
+                setLatInput(''); setLonInput('');
+                setGnssAccuracy(null); setGnssError(null);
+                setPending({ px: 50, py: 50 });
+                setActiveTool('point');
+                setTimeout(() => captureGnss(), 100);
+              }}
+              disabled={!pdfName}
+              className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg border border-accent/40 bg-accent/10 py-2.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Icon name="Satellite" size={14} />
+              Снять точку через GNSS
+            </button>
           </section>
 
+          {/* Measurements */}
           <section className="border-t border-border p-5">
             <h3 className="mb-3 font-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground">Измерения</h3>
             <div className="grid grid-cols-2 gap-2">
