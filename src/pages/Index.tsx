@@ -1,5 +1,9 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import Icon from '@/components/ui/icon';
+import * as pdfjsLib from 'pdfjs-dist';
+import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
 
 interface ControlPoint {
   id: number;
@@ -29,11 +33,66 @@ const tools = [
 const Index = () => {
   const [activeTool, setActiveTool] = useState('point');
   const [selectedPoint, setSelectedPoint] = useState<number>(3);
+  const [pdfName, setPdfName] = useState<string | null>(null);
+  const [pdfPages, setPdfPages] = useState(0);
+  const [pageNum, setPageNum] = useState(1);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const pdfDocRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
 
   const fixedCount = controlPoints.filter((p) => p.status === 'fixed').length;
 
+  const renderPage = async (num: number) => {
+    const pdf = pdfDocRef.current;
+    const canvas = canvasRef.current;
+    if (!pdf || !canvas) return;
+    const page = await pdf.getPage(num);
+    const viewport = page.getViewport({ scale: 2 });
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+  };
+
+  const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.type !== 'application/pdf') {
+      setError('Нужен PDF-файл');
+      return;
+    }
+    setError(null);
+    setLoading(true);
+    try {
+      const buffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+      pdfDocRef.current = pdf;
+      setPdfName(file.name);
+      setPdfPages(pdf.numPages);
+      setPageNum(1);
+      await renderPage(1);
+    } catch {
+      setError('Не удалось открыть PDF');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const changePage = async (dir: number) => {
+    const next = pageNum + dir;
+    if (next < 1 || next > pdfPages) return;
+    setPageNum(next);
+    await renderPage(next);
+  };
+
   return (
     <div className="min-h-screen flex flex-col bg-background text-foreground">
+      <input ref={fileInputRef} type="file" accept="application/pdf" className="hidden" onChange={handleFile} />
+
       {/* Top bar */}
       <header className="flex items-center justify-between border-b border-border px-5 h-14 shrink-0">
         <div className="flex items-center gap-3">
@@ -58,7 +117,10 @@ const Index = () => {
           </span>
         </div>
 
-        <button className="flex items-center gap-2 rounded-md bg-primary px-3.5 py-1.5 text-sm font-medium text-primary-foreground transition-transform hover:scale-[1.03]">
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="flex items-center gap-2 rounded-md bg-primary px-3.5 py-1.5 text-sm font-medium text-primary-foreground transition-transform hover:scale-[1.03]"
+        >
           <Icon name="Upload" size={15} />
           Загрузить PDF
         </button>
@@ -89,62 +151,114 @@ const Index = () => {
         </nav>
 
         {/* Map canvas */}
-        <main className="relative flex-1 overflow-hidden grid-blueprint-fine">
+        <main className="relative flex-1 overflow-auto grid-blueprint-fine">
           {/* scan line */}
-          <div className="pointer-events-none absolute inset-x-0 top-0 h-px animate-scan bg-primary/40 shadow-[0_0_12px_2px_hsl(var(--primary)/0.5)]" />
+          <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-px animate-scan bg-primary/40 shadow-[0_0_12px_2px_hsl(var(--primary)/0.5)]" />
 
-          {/* PDF map mock frame */}
+          {/* PDF map frame */}
           <div className="absolute inset-8 rounded-lg border border-dashed border-primary/30">
-            <div className="absolute left-3 top-3 rounded bg-card/80 px-2 py-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground backdrop-blur">
-              план_участка_2026.pdf
+            <div className="absolute left-3 top-3 z-20 rounded bg-card/80 px-2 py-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground backdrop-blur">
+              {pdfName ?? 'карта не загружена'}
             </div>
 
-            {/* contour mock */}
-            <svg className="absolute inset-0 h-full w-full" preserveAspectRatio="none">
-              <polygon
-                points="18%,30% 55%,18% 85%,40% 72%,82% 30%,76%"
-                fill="hsl(var(--primary) / 0.05)"
-                stroke="hsl(var(--primary) / 0.5)"
-                strokeWidth="1.5"
-                strokeDasharray="6 4"
-              />
-            </svg>
+            {/* empty state */}
+            {!pdfName && !loading && (
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-muted-foreground transition-colors hover:text-primary"
+              >
+                <Icon name="FileUp" size={48} className="text-primary/60" />
+                <div className="text-sm">Перетащите или выберите PDF-карту</div>
+                <div className="font-mono text-[11px] text-muted-foreground">.pdf · до 50 МБ</div>
+              </button>
+            )}
+
+            {loading && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-muted-foreground">
+                <Icon name="LoaderCircle" size={36} className="animate-spin text-primary" />
+                <div className="font-mono text-xs">Рендеринг страницы…</div>
+              </div>
+            )}
+
+            {/* rendered PDF */}
+            <div className={`absolute inset-0 overflow-auto p-2 ${pdfName ? 'block' : 'hidden'}`}>
+              <canvas ref={canvasRef} className="mx-auto rounded shadow-2xl" />
+            </div>
+
+            {/* contour overlay */}
+            {pdfName && (
+              <svg className="pointer-events-none absolute inset-0 h-full w-full" preserveAspectRatio="none">
+                <polygon
+                  points="18%,30% 55%,18% 85%,40% 72%,82% 30%,76%"
+                  fill="hsl(var(--primary) / 0.05)"
+                  stroke="hsl(var(--primary) / 0.6)"
+                  strokeWidth="1.5"
+                  strokeDasharray="6 4"
+                />
+              </svg>
+            )}
 
             {/* control points */}
-            {controlPoints.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => setSelectedPoint(p.id)}
-                style={{ left: `${p.px}%`, top: `${p.py}%` }}
-                className="group absolute -translate-x-1/2 -translate-y-1/2"
-              >
-                <span
-                  className={`relative flex h-5 w-5 items-center justify-center rounded-full border-2 transition-transform group-hover:scale-125 ${
-                    p.status === 'fixed'
-                      ? 'border-primary bg-primary/20'
-                      : 'border-accent bg-accent/20 animate-pulse'
-                  } ${selectedPoint === p.id ? 'scale-125' : ''}`}
+            {pdfName &&
+              controlPoints.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => setSelectedPoint(p.id)}
+                  style={{ left: `${p.px}%`, top: `${p.py}%` }}
+                  className="group absolute z-20 -translate-x-1/2 -translate-y-1/2"
                 >
                   <span
-                    className={`h-1.5 w-1.5 rounded-full ${
-                      p.status === 'fixed' ? 'bg-primary' : 'bg-accent'
-                    }`}
-                  />
-                </span>
-                <span className="absolute left-6 top-1/2 -translate-y-1/2 whitespace-nowrap rounded bg-card px-1.5 py-0.5 font-mono text-[10px] text-foreground opacity-0 transition-opacity group-hover:opacity-100">
-                  {p.label}
-                </span>
-              </button>
-            ))}
-
-            {/* crosshair */}
-            <div className="pointer-events-none absolute right-6 bottom-6 flex h-16 w-16 items-center justify-center">
-              <Icon name="Crosshair" size={56} className="text-primary/25" />
-            </div>
+                    className={`relative flex h-5 w-5 items-center justify-center rounded-full border-2 transition-transform group-hover:scale-125 ${
+                      p.status === 'fixed'
+                        ? 'border-primary bg-primary/20'
+                        : 'border-accent bg-accent/20 animate-pulse'
+                    } ${selectedPoint === p.id ? 'scale-125' : ''}`}
+                  >
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full ${
+                        p.status === 'fixed' ? 'bg-primary' : 'bg-accent'
+                      }`}
+                    />
+                  </span>
+                  <span className="absolute left-6 top-1/2 -translate-y-1/2 whitespace-nowrap rounded bg-card px-1.5 py-0.5 font-mono text-[10px] text-foreground opacity-0 transition-opacity group-hover:opacity-100">
+                    {p.label}
+                  </span>
+                </button>
+              ))}
           </div>
 
+          {/* page navigation */}
+          {pdfPages > 1 && (
+            <div className="absolute bottom-4 right-4 z-20 flex items-center gap-2 rounded-md border border-border bg-card/80 px-2 py-1.5 font-mono text-xs backdrop-blur">
+              <button
+                onClick={() => changePage(-1)}
+                disabled={pageNum === 1}
+                className="rounded p-1 hover:bg-secondary disabled:opacity-30"
+              >
+                <Icon name="ChevronLeft" size={16} />
+              </button>
+              <span className="text-muted-foreground">
+                стр. <span className="text-primary">{pageNum}</span> / {pdfPages}
+              </span>
+              <button
+                onClick={() => changePage(1)}
+                disabled={pageNum === pdfPages}
+                className="rounded p-1 hover:bg-secondary disabled:opacity-30"
+              >
+                <Icon name="ChevronRight" size={16} />
+              </button>
+            </div>
+          )}
+
+          {error && (
+            <div className="absolute bottom-4 left-1/2 z-20 -translate-x-1/2 flex items-center gap-2 rounded-md border border-destructive bg-destructive/15 px-3 py-2 text-xs text-destructive-foreground">
+              <Icon name="TriangleAlert" size={14} />
+              {error}
+            </div>
+          )}
+
           {/* coords HUD */}
-          <div className="absolute bottom-4 left-4 flex items-center gap-4 rounded-md border border-border bg-card/80 px-3 py-2 font-mono text-xs backdrop-blur">
+          <div className="absolute bottom-4 left-4 z-20 flex items-center gap-4 rounded-md border border-border bg-card/80 px-3 py-2 font-mono text-xs backdrop-blur">
             <span className="text-muted-foreground">
               N <span className="text-primary">55.750118</span>
             </span>
@@ -164,9 +278,7 @@ const Index = () => {
                 <Icon name="Target" size={16} className="text-primary" />
                 Калибровка карты
               </h2>
-              <span className="font-mono text-xs text-muted-foreground">
-                {fixedCount}/4 точки
-              </span>
+              <span className="font-mono text-xs text-muted-foreground">{fixedCount}/4 точки</span>
             </div>
             <div className="mb-3 h-1.5 w-full overflow-hidden rounded-full bg-secondary">
               <div
@@ -203,9 +315,7 @@ const Index = () => {
                     </span>
                     <span
                       className={`rounded px-1.5 py-0.5 font-mono text-[10px] uppercase ${
-                        p.status === 'fixed'
-                          ? 'bg-primary/15 text-primary'
-                          : 'bg-accent/15 text-accent'
+                        p.status === 'fixed' ? 'bg-primary/15 text-primary' : 'bg-accent/15 text-accent'
                       }`}
                     >
                       {p.status === 'fixed' ? 'привязана' : 'GNSS-фикс'}
